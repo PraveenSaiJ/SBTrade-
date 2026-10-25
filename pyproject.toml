@@ -1,0 +1,34 @@
+[project]
+name = "sbtrade"
+version = "0.1.0"
+description = "Personal trading recommendation tool (never places orders)"
+readme = "README.md"
+authors = [
+    { name = "Praveen", email = "tvr2nyc@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "pandas>=2.2",
+    "ib-async>=1.0",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "streamlit>=1.65.0",
+    "schwab-py>=1.5.1",
+    "truststore>=0.10.4",
+    "httpx>=0.28.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+tool = "tool.cli:main"
+
+[tool.uv.build-backend]
+module-name = "tool"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"

@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets and personal data
+.env
+config/holdings.yaml
+config/schwab_token.json
+config/*.bak
+config/robinhood*.csv
+config/*orders*.csv
+config/*transactions*.csv
+data/
+
+# Caches
+.pytest_cache/
+.ruff_cache/

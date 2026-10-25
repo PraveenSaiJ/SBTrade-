@@ -1,0 +1,9 @@
+# Optional overrides for the swing screener (defaults live in src/tool/config.py).
+screener:
+  min_volume_ratio: 1.5      # breakout-day volume / 20-day average
+  hold_days: 10              # trading days; earnings inside this window exclude a setup (--allow-earnings keeps them)
+  trend_filter: sma200       # sma200 | sma50_rising | off
+  rsi_max: 75
+  overextension_atr: 2.0     # exclude when spot - entry exceeds this many ATR(14)
+  resistance_lookback: 60
+  post_earnings_days: 10     # trading days after a report that show "Reported <date>"
