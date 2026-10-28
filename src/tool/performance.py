@@ -174,7 +174,18 @@ def open_mark(scored: pd.DataFrame) -> float:
     return float(pd.to_numeric(scored[scored["result"] == "OPEN"]["r"], errors="coerce").sum())
 
 
-BUY_FAMILIES = ("directional_call", "long_call", "long_put", "weekly_call", "weekly_put", "lotto_call", "lotto_put", "mag7_lotto_call", "mag7_swing_call", "odte_call")
+def score_all(store, last_day: date) -> dict[str, pd.DataFrame]:
+    """Scored swing signals (recommended and excluded) and option buy ideas, from completed bars up to `last_day`."""
+    swing = score_ideas(load_signal_ideas(store._conn, "recommended"), store.load_daily_bars, lambda i: 1, lambda i: "limit", last_day)
+    skipped = score_ideas(load_signal_ideas(store._conn, "excluded"), store.load_daily_bars, lambda i: 1, lambda i: "limit", last_day)
+    options = score_ideas(
+        load_option_ideas(store._conn), store.load_daily_bars,
+        lambda i: -1 if str(i["group"]).endswith("put") else 1, lambda i: "stop", last_day,
+    )
+    return {"swing": swing, "skipped": skipped, "options": options}
+
+
+BUY_FAMILIES = ("directional_call", "long_call", "long_put", "weekly_call", "weekly_put", "lotto_call", "lotto_put", "mag7_lotto_call", "mag7_swing_call", "odte_call", "odte_put")
 
 
 def load_signal_ideas(conn, status: str = "recommended") -> pd.DataFrame:

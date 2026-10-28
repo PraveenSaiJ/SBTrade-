@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 
 from tool.levels import NY
+from tool.market_calendar import is_trading_day, previous_trading_day
 from tool.config import get_config
 
 _F = get_config().freshness
@@ -28,10 +29,8 @@ MAX_AGE = {"intraday": timedelta(minutes=_F.intraday_max_minutes), "hourly": tim
 
 
 def previous_weekday(day: date) -> date:
-    day -= timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
-    return day
+    """The previous trading day (weekends and NYSE holidays skipped)."""
+    return previous_trading_day(day)
 
 
 def market_is_open(now: datetime) -> bool:
@@ -40,7 +39,7 @@ def market_is_open(now: datetime) -> bool:
 
 def last_session_date(now: datetime) -> date:
     """The most recent trading day that has started: today once the market opens, else the prior weekday."""
-    if now.weekday() >= 5:
+    if not is_trading_day(now.date()):
         return previous_weekday(now.date() + timedelta(days=1))
     return now.date() if now.time() >= MARKET_OPEN else previous_weekday(now.date())
 

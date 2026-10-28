@@ -216,6 +216,8 @@ def recommend_directional(
         except Exception as exc:
             out.append(BuyRec(cand.symbol, "call", "swing", "skip", f"data error: {exc}"))
             continue
+        if hasattr(source, "hint_chains"):
+            source.hint_chains(cand.symbol, "C", expiries)
         seen: set[date] = set()  # names with only monthly expiries resolve several targets to the same contract
         for target in expiries:
             rec = _one("directional_call", cand, source, now, events, spot, closes, rank_fn, target,

@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -574,6 +575,9 @@ def render_risk() -> None:
         st.dataframe(themes, hide_index=True, width="stretch", column_config={"weight": st.column_config.ProgressColumn("Weight", format="percent", min_value=0, max_value=1)})
     with st.expander("All positions"):
         st.dataframe(positions, hide_index=True, width="stretch")
+        csv_download(positions, "portfolio-positions", "csv-portfolio-positions", label="Download positions (CSV)")
+    if not risk.empty:
+        csv_download(risk, "portfolio-this-week", "csv-portfolio-week", label="Download this-week risk (CSV)")
 
 
 def render_portfolio() -> None:
@@ -802,6 +806,7 @@ def render_option_family(
             "Moderate / Aggressive and are listed under 'Watch list' below. Schwab sometimes returns no greeks right "
             "after the open; run the options job again from the Jobs tab."
         )
+    exported: list[pd.DataFrame] = []
     for key, title, definition in SECTIONS:
         part = recommended[recommended["bucket"] == key]
         shown = part if top_n is None else part.head(top_n)
@@ -811,6 +816,9 @@ def render_option_family(
             st.caption("None in this run.")
         else:
             st.dataframe(_option_table(shown, side), hide_index=True, width="stretch")
+            exported.append(_option_table(part, side).assign(Section=title))
+    if exported:
+        csv_download(pd.concat(exported, ignore_index=True), family, f"csv-{family}-{'-'.join(expiries or ['all'])}", recs["run_ts"].max())
 
     skipped = recs[(recs["status"] != "recommend") & ~recs["reason"].fillna("").str.startswith(TRANSIENT_ERRORS)]
     no_delta = recommended[recommended["bucket"].isna()].assign(
@@ -899,6 +907,7 @@ def render_support_puts(themes: list[str], top_n: int | None) -> None:
         event = st.dataframe(
             view, hide_index=True, width="stretch", on_select="rerun", selection_mode="multi-row", key="pick_csp_support"
         )
+        csv_download(view, "puts-at-support", "csv-csp-support", recs["run_ts"].max())
         picked = event.selection.rows if event is not None else []
         st.markdown("**Collateral check**")
         accounts = sorted(set(cfg.cash) | {"rh_taxable", "rh_ira", "ibkr"})
@@ -927,12 +936,29 @@ def render_puts_tab() -> None:
         )
 
     buy_hint = "No buy run yet. Run the buys job in the Jobs tab."
-    tab_support, tab_weekly, tab_lotto, tab_monthly, tab_earnings = st.tabs(
-        ["At support (7-45 DTE)", "Weekly puts", "Lottos", "Monthly puts", "Earnings"]
+    tab_support, tab_weekly, tab_lotto, tab_odte, tab_monthly, tab_earnings = st.tabs(
+        ["At support (7-45 DTE)", "Weekly puts", "Lottos", "0DTE", "Monthly puts", "Earnings"]
     )
+    with tab_odte:
+        st.error(
+            "0DTE puts expire TODAY and can lose their whole premium within minutes. Quotes must be live (the 0DTE job "
+            "refreshes every 15 minutes in market hours), and the position should be closed before the bell."
+        )
+        render_buy_family(
+            "odte_put", "0DTE puts (expire today)",
+            "Same-day puts on SPY, QQQ, IWM, and the MAG7, planned from today's daily pivots: buy below the pivot, "
+            "stop halfway to R1, targets at S1 and S2. If nothing expires today, the next expiry is used and noted.",
+            "No 0DTE run yet. Run the 0DTE job in the Jobs tab.", themes, [], top_n,
+        )
     with tab_support:
         render_support_puts(themes, top_n)
     with tab_weekly:
+        render_buy_family(
+            "weekly_put", "Weekly puts (buy, about 0.50 delta)",
+            "Puts that expire this week with delta near 0.50 on downtrend names, with the stock's trigger, stop and two "
+            "targets. Refreshed every 30 minutes by the weekly job.",
+            "No weekly run yet. Run the weekly job in the Jobs tab.", themes, [], top_n,
+        )
         st.caption("Selling puts that expire this week or next: collect premium, strike at or below weekly S1.")
         sell("csp", "Cash-secured puts (weekly)", "weekly")
         sell("naked_put", "Naked puts (weekly): loss to strike minus premium if the stock goes to zero", "weekly")
@@ -1010,10 +1036,10 @@ def _buy_table(rows: pd.DataFrame, side: str) -> pd.DataFrame:
     return view[keep]
 
 
-def render_bought_form(family: str, idea: pd.Series) -> None:
+def render_bought_form(family: str, idea: pd.Series, scope: str = "") -> None:
     """Log a purchase of the selected idea. This records it for tracking only; nothing is ordered."""
     ask = float(idea["ask"]) if pd.notna(idea.get("ask")) else 0.0
-    with st.form(f"bought_{family}"):
+    with st.form(f"bought_{scope}{family}"):
         st.markdown(
             f"**Log purchase: {idea['symbol']} {idea['expiry']} ${float(idea['strike']):.2f} "
             f"{'call' if family.endswith('call') else 'put'}**"
@@ -1106,8 +1132,10 @@ def render_bought_tracker() -> None:
 
 
 def render_buy_family(
-    family: str, title: str, definition: str, hint: str, themes: list[str], triggers: list[str], top_n: int | None
+    family: str, title: str, definition: str, hint: str, themes: list[str], triggers: list[str], top_n: int | None,
+    scope: str = "",
 ) -> None:
+    """`scope` keeps widget keys unique when the same family is shown on more than one tab."""
     store = Store()
     try:
         recs = store.latest_option_recs(family)
@@ -1148,11 +1176,14 @@ def render_buy_family(
     else:
         event = st.dataframe(
             _buy_table(shown, side), hide_index=True, width="stretch", on_select="rerun",
-            selection_mode="single-row", key=f"pick_{family}",
+            selection_mode="single-row", key=f"pick_{scope}{family}",
         )
+        csv_download(_buy_table(good.assign(
+            why=[buy_why(r, setup_rows.get(r["symbol"]), family) for _, r in good.iterrows()],
+            size=good["symbol"].map(size_of)), side), family, f"csv-{scope}{family}", recs["run_ts"].max())
         picked = event.selection.rows if event is not None else []
         if picked:
-            render_bought_form(family, shown.iloc[picked[0]])
+            render_bought_form(family, shown.iloc[picked[0]], scope)
         else:
             st.caption("Select a row to log that option as bought and track it.")
 
@@ -1168,7 +1199,8 @@ def render_buy_family(
 
 
 def render_call_ideas(
-    family: str, title: str, definition: str, themes: list[str], triggers: list[str], top_n: int | None
+    family: str, title: str, definition: str, themes: list[str], triggers: list[str], top_n: int | None,
+    max_ratio: float | None = None,
 ) -> None:
     """Directional or LEAPS calls: break-even against the expected move, IV rank, theta, max loss and position size."""
     store = Store()
@@ -1189,8 +1221,15 @@ def render_call_ideas(
     good = recs[recs["status"] == "recommend"]
     if triggers:
         good = good[good["trigger"].isin(triggers)]
+    if max_ratio is not None:
+        within = st.checkbox(
+            f"Only calls whose break-even is within the expected move (ratio {max_ratio:.1f} or less)", value=True,
+            key=f"within_{family}",
+        )
+        if within:
+            good = good[pd.to_numeric(good["be_vs_move"], errors="coerce") <= max_ratio]
     good = good.assign(
-        _order=good["trigger"].map(TRIGGER_ORDER), _ratio=pd.to_numeric(good["be_vs_move"], errors="coerce")
+        _order=good["trigger"].map(TRIGGER_ORDER).fillna(0), _ratio=pd.to_numeric(good["be_vs_move"], errors="coerce")
     ).sort_values(["_order", "_ratio"], ascending=[True, True], na_position="last")
     shown = good if top_n is None else good.head(top_n)
     st.caption(
@@ -1225,6 +1264,7 @@ def render_call_ideas(
             view.dropna(axis=1, how="all"), hide_index=True, width="stretch", on_select="rerun",
             selection_mode="single-row", key=f"pick_{family}",
         )
+        csv_download(view.dropna(axis=1, how="all"), family, f"csv-{family}", recs["run_ts"].max())
         picked = event.selection.rows if event is not None else []
         if picked:
             render_bought_form(family, shown.iloc[picked[0]])
@@ -1262,9 +1302,22 @@ def render_calls_tab() -> None:
             family, title, definition, "No buy run yet. Run the buys job in the Jobs tab.", themes, triggers, top_n
         )
 
-    tab_dir, tab_leaps, tab_weekly, tab_lotto, tab_odte, tab_mag7, tab_monthly = st.tabs(
-        ["Directional (14-60 DTE)", "LEAPS (270+ DTE)", "Weekly calls", "Weekly lottos", "0DTE", "MAG7", "Monthly calls"]
+    tab_dir, tab_leaps, tab_earn, tab_weekly, tab_lotto, tab_odte, tab_mag7, tab_monthly = st.tabs(
+        ["Directional (14-60 DTE)", "LEAPS (270+ DTE)", "Earnings", "Weekly calls", "Weekly lottos", "0DTE", "MAG7",
+         "Monthly calls"]
     )
+    with tab_earn:
+        st.warning(
+            "Buying calls into earnings is a bet that the stock moves MORE than the market already expects. Implied "
+            "volatility usually collapses after the report, so a call can lose money even when the stock rises. The "
+            "most you can lose is the whole premium. Size small; sell the morning after the report."
+        )
+        render_call_ideas(
+            "earnings_call", "Earnings calls (buy)",
+            "Near-the-money calls (delta 0.45-0.55) on holdings, watchlist, MAG7 and scanned names reporting in the next "
+            f"{get_config().calls.earnings_days} days, expiring the first Friday after the report.",
+            themes, [], top_n, max_ratio=get_config().calls.earnings_max_ratio,
+        )
     with tab_dir:
         render_call_ideas(
             "directional_call", "Directional calls (buy)",
@@ -1296,7 +1349,7 @@ def render_calls_tab() -> None:
         )
     with tab_odte:
         st.error(
-            "0DTE calls expire TODAY and can lose their whole premium within minutes. Quotes must be live (the buys "
+            "0DTE calls expire TODAY and can lose their whole premium within minutes. Quotes must be live (the 0DTE "
             "job refreshes every 15 minutes in market hours), and the position should be closed before the bell."
         )
         buy(
@@ -1319,6 +1372,57 @@ def render_calls_tab() -> None:
             "long_call", "Swing calls (buy, monthly, about 0.50 delta)",
             "Monthly calls with delta near 0.50 on bullish setups, with the stock's entry, stop, and two targets.",
         )
+
+
+def render_options_hub() -> None:
+    """Short-dated options to BUY in one place: weekly, lottos and 0DTE, calls and puts side by side.
+
+    The same ideas also stay on the Calls and Puts tabs; this tab only gathers them."""
+    st.caption(
+        "Short-dated options you BUY, calls and puts together: weekly, lottos and 0DTE. The most you can lose is the premium. "
+        "The same ideas are also on the Calls and Puts tabs."
+    )
+    c1, c2, c3 = st.columns([4, 3, 1])
+    themes = c1.multiselect("Theme", all_themes(), key="hub_themes", placeholder="All themes")
+    triggers = c2.multiselect("Trigger status", TRIGGER_CHOICES, key="hub_trigger", placeholder="All statuses")
+    top = c3.selectbox("Rows per section", [5, 10, 25, 50, "All"], index=1, key="hub_top")
+    top_n = None if top == "All" else int(top)
+
+    def buy(family: str, title: str, definition: str, hint: str) -> None:
+        render_buy_family(family, title, definition, hint, themes, triggers, top_n, scope="hub-")
+
+    tab_weekly, tab_lotto, tab_odte = st.tabs(["Weekly calls and puts", "Lottos", "0DTE"])
+    weekly_hint = "No weekly run yet. Run the weekly job in the Jobs tab."
+    with tab_weekly:
+        st.caption("Refreshed every 30 minutes by the weekly job.")
+        buy("weekly_call", "Weekly calls (buy, about 0.50 delta)",
+            "Calls that expire this Friday with delta near 0.50 on bullish setups, with the stock's entry, stop and two targets.",
+            weekly_hint)
+        buy("weekly_put", "Weekly puts (buy, about 0.50 delta)",
+            "Puts that expire this Friday with delta near 0.50 on downtrend names, with the stock's trigger, stop and two targets.",
+            weekly_hint)
+    with tab_lotto:
+        st.warning(
+            "Lottos are cheap out-of-the-money weekly options. The most you can lose is the premium, and most expire "
+            "worthless. Size them small, and buy only after the trigger."
+        )
+        buy("lotto_call", "Weekly lotto calls (buy)",
+            "Cheap out-of-the-money weekly calls, picked for the best payoff if the stock reaches its first target.", weekly_hint)
+        buy("lotto_put", "Weekly lotto puts (buy)",
+            "Cheap out-of-the-money weekly puts on downtrend names, picked for the best payoff if the stock reaches its first target.",
+            weekly_hint)
+    with tab_odte:
+        st.error(
+            "0DTE options expire TODAY and can lose their whole premium within minutes. Quotes must be live (the 0DTE job "
+            "refreshes every 15 minutes in market hours), and the position should be closed before the bell."
+        )
+        odte_hint = "No 0DTE run yet. Run the 0DTE job in the Jobs tab."
+        buy("odte_call", "0DTE calls (expire today)",
+            "Same-day calls on SPY, QQQ, IWM and the MAG7 from today's daily pivots: buy above the pivot, stop halfway to S1, targets R1 and R2.",
+            odte_hint)
+        buy("odte_put", "0DTE puts (expire today)",
+            "Same-day puts on SPY, QQQ, IWM and the MAG7 from today's daily pivots: buy below the pivot, stop halfway to R1, targets S1 and S2.",
+            odte_hint)
 
 
 def render_levels_tab(holdings: Holdings) -> None:
@@ -1453,6 +1557,7 @@ def render_holdings_review() -> None:
         "Quality /6": num("quality"), "Trend /3": num("trend"), "Conviction": num("conviction").round(0),
     })
     st.dataframe(view.dropna(axis=1, how="all"), hide_index=True, width="stretch")
+    csv_download(view.dropna(axis=1, how="all"), "holdings-review", "csv-holdings-review", review["as_of"].iloc[0])
 
 
 def render_consolidation() -> None:
@@ -1554,6 +1659,8 @@ def render_longterm_ideas() -> None:
         ("wait", "Wait for a pullback", "Quality and trend pass, but the price is extended; Entry is the pullback level."),
     ):
         part = recs[recs["status"] == status].sort_values(["quality", "trend"], ascending=False)
+        if not part.empty:
+            csv_download(table(part).assign(Status=title), f"long-term-{status}", f"csv-long-{status}", recs["run_ts"].iloc[0])
         shown = part if top == "All" else part.head(int(top))
         st.markdown(f"**{title}** · {len(part)}" + (f" (showing {len(shown)})" if len(shown) < len(part) else "") + f" — {note}")
         if part.empty:
@@ -1596,6 +1703,18 @@ def render_roll_panel(open_calls: pd.DataFrame) -> None:
                 st.caption(str(call["detail"]))
 
 
+def csv_download(df: pd.DataFrame, name: str, key: str, data_as_of: object = None, label: str = "Download CSV") -> None:
+    """Offer the table as a CSV (opens in Excel). A data-as-of column is added so the file carries its own timestamp."""
+    if df is None or df.empty:
+        return
+    out = df.copy()
+    if data_as_of is not None:
+        out.insert(0, "Data as of", str(data_as_of))
+    today = datetime.now(NY).date().isoformat()
+    st.download_button(label, data=out.to_csv(index=False).encode("utf-8-sig"), file_name=f"sbtrade-{name}-{today}.csv",
+                       mime="text/csv", key=key)
+
+
 def render_cc_tiers() -> None:
     """New covered calls to open, by tier: the income row (nearest the money at the tier's target) and the guardrail row."""
     from tool.income_calls import tier_target
@@ -1621,6 +1740,7 @@ def render_cc_tiers() -> None:
         return
     recs["tier"] = recs["tier"].fillna("other")
     recs["mode"] = recs["mode"].fillna("guardrail")
+    exported: list[pd.DataFrame] = []
     for tier in TIER_ORDER:
         part = recs[recs["tier"] == tier]
         if part.empty:
@@ -1639,7 +1759,11 @@ def render_cc_tiers() -> None:
             "Premium/lot": (bid * 100).round(0), "Total premium": (bid * 100 * part["free_lots"]).round(0),
             "Flags": part["flags"].fillna(""), "Notes": part["notes"].fillna(""),
         })
-        st.dataframe(view.dropna(axis=1, how="all"), hide_index=True, width="stretch")
+        view = view.dropna(axis=1, how="all")
+        st.dataframe(view, hide_index=True, width="stretch")
+        exported.append(view.assign(Tier=tier))
+    if exported:
+        csv_download(pd.concat(exported, ignore_index=True), "covered-calls", "csv-covered-calls", saved["run_ts"].iloc[0])
     held = saved[saved["reason"].fillna("").str.contains("uncapped|no_covered_calls", regex=True)]
     if not held.empty:
         names = ", ".join(sorted({f"{r.symbol} ({r.account})" for r in held.itertuples()}))
@@ -1776,7 +1900,9 @@ def render_swing() -> None:
                 "under the entry; T1 is capped at the nearest overhead resistance; R:R is measured from where you would "
                 "buy (the higher of price and entry)."
             )
-            st.dataframe(_setup_view(top), hide_index=True, width="stretch")
+            setup_table = _setup_view(top)
+            st.dataframe(setup_table, hide_index=True, width="stretch")
+            csv_download(setup_table, "swing", "csv-swing", setups["scan_date"].max(), "Download recommendations (CSV)")
             if "shares" not in top or top["shares"].isna().all():
                 st.caption("Position sizing is off: set `account: {account_size: ...}` in config/settings.yaml to see shares.")
         failed = tradable[is_failed]
@@ -1855,6 +1981,65 @@ def render_saved(kinds: tuple[str, ...], empty_hint: str) -> None:
     st.dataframe(shown[["Time", "Symbol", "Type", "Detail"]], hide_index=True, width="stretch")
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _scheduled_tasks() -> list[dict]:
+    from tool.jobs import scheduled_tasks
+
+    return scheduled_tasks()
+
+
+def render_job_overview(jobs: JobManager) -> None:
+    """Market-day banner, run history, the Task Scheduler schedule and recent notifications."""
+    from tool.market_calendar import early_close, holiday_name, is_trading_day, next_holiday
+    from tool.notify import notify, recent
+
+    today = datetime.now(NY).date()
+    closed = holiday_name(today)
+    if closed:
+        st.warning(f"Market closed today ({closed}). Scheduled jobs skip closed days.")
+    elif not is_trading_day(today):
+        st.info("Weekend: scheduled jobs skip closed days.")
+    elif early_close(today):
+        st.info(f"Early close today ({early_close(today)}), 1:00 PM ET.")
+    upcoming = next_holiday(today)
+    if upcoming:
+        st.caption(f"Next market holiday: {upcoming[1]}, {upcoming[0]:%a %b %d}.")
+
+    st.markdown("#### Run history")
+    history = pd.DataFrame(jobs.history(100))
+    if history.empty:
+        st.caption("No runs recorded yet. Runs are logged from now on.")
+    else:
+        history["duration"] = (pd.to_datetime(history["ended_at"], errors="coerce") - pd.to_datetime(history["started_at"], errors="coerce")
+                               ).dt.total_seconds().div(60).round(1)
+        view = history.rename(columns={"job": "Job", "trigger": "Trigger", "started_at": "Start", "ended_at": "End", "status": "Status",
+                                       "rows": "Rows", "errors": "Errors", "error_text": "Note", "duration": "Minutes"})
+        failed = int(view["Status"].isin(["failed", "stopped"]).sum())
+        if failed:
+            st.caption(f"{failed} of the last {len(view)} runs failed or were stopped.")
+        st.dataframe(view[["Job", "Trigger", "Start", "End", "Minutes", "Status", "Rows", "Errors", "Note"]],
+                     hide_index=True, width="stretch")
+
+    st.markdown("#### Schedule (Windows Task Scheduler)")
+    tasks = _scheduled_tasks()
+    if tasks:
+        sched = pd.DataFrame(tasks).rename(columns={"name": "Task", "state": "State", "next_run": "Next run", "last_run": "Last run",
+                                                    "last_result": "Last result code"})
+        st.dataframe(sched.sort_values("Next run"), hide_index=True, width="stretch")
+        st.caption("Result code 0 = success. Register or update the tasks with: powershell -File scripts\\register_tasks.ps1")
+    else:
+        st.caption("No SBTrade tasks found (or they cannot be read). Register them with: powershell -File scripts\\register_tasks.ps1")
+
+    with st.expander("Notifications"):
+        if st.button("Send test notification", key="test_notify"):
+            notify("SBTrade test", "Desktop notifications are working.")
+        rows = recent(20)
+        if rows:
+            st.dataframe(pd.DataFrame(rows, columns=["Time", "Title", "Message"]), hide_index=True, width="stretch")
+        else:
+            st.caption("Nothing yet. A notification is raised when a scheduled job fails or the Schwab sign-in is needed.")
+
+
 def render_jobs() -> None:
     jobs = JobManager()
 
@@ -1887,6 +2072,7 @@ def render_jobs() -> None:
                 st.code("\n".join(l for l in lines if "authlib" not in l.lower() and "httpx2" not in l)[-1500:] or "no output yet")
 
     login_panel()
+    render_job_overview(jobs)
 
     @st.fragment(run_every=5)
     def job_panel() -> None:
@@ -2073,7 +2259,13 @@ def render_whales_tab() -> None:
     columns = ["Ticker", "Company size", "Strike", "Type", "Expiry", "Days", "Stock", "From spot", "Volume", "Open int",
                "Vol / OI", "Intent", "Price", "Premium ($M)", "Traded at", "Lean", "Size", "Burst",
                "Added since last scan ($M)", "Yours", "Delta"] + (["Noise"] if show_noise else [])
-    st.dataframe(top[[c for c in columns if c in top.columns]].dropna(axis=1, how="all"), hide_index=True, width="stretch")
+    largest = top[[c for c in columns if c in top.columns]].dropna(axis=1, how="all")
+    st.dataframe(largest, hide_index=True, width="stretch")
+    c_a, c_b = st.columns(2)
+    with c_a:
+        csv_download(largest, "whales-contracts", "csv-whales-contracts", latest["ts"].iloc[0], "Download contracts (CSV)")
+    with c_b:
+        csv_download(by, "whales-by-ticker", "csv-whales-by-ticker", latest["ts"].iloc[0], "Download by ticker (CSV)")
     with st.expander("Scan history (last 7 days)"):
         hist = runs.assign(premium=(runs["premium"] / 1e6).round(1)).rename(
             columns={"ts": "Scan time", "rows": "Contracts", "premium": "Premium ($M)"}
@@ -2085,20 +2277,13 @@ def render_whales_tab() -> None:
 @st.cache_data(ttl=600, show_spinner="Scoring past ideas...")
 def performance_scores(last_bar_day: str) -> dict[str, pd.DataFrame]:
     """Scored ideas: swing signals that were recommended, swing signals the filters excluded, and option buy ideas."""
-    from tool.performance import load_option_ideas, load_signal_ideas, score_ideas
+    from tool.performance import score_all
 
     store = Store()
     try:
-        day = date.fromisoformat(last_bar_day)
-        swing = score_ideas(load_signal_ideas(store._conn, "recommended"), store.load_daily_bars, lambda i: 1, lambda i: "limit", day)
-        skipped = score_ideas(load_signal_ideas(store._conn, "excluded"), store.load_daily_bars, lambda i: 1, lambda i: "limit", day)
-        options = score_ideas(
-            load_option_ideas(store._conn), store.load_daily_bars,
-            lambda i: -1 if str(i["group"]).endswith("put") else 1, lambda i: "stop", day,
-        )
+        return score_all(store, date.fromisoformat(last_bar_day))
     finally:
         store.close()
-    return {"swing": swing, "skipped": skipped, "options": options}
 
 
 def _curve_chart(curves: dict[str, pd.DataFrame]) -> None:
@@ -2153,6 +2338,8 @@ def _scoreboard(title: str, scored: pd.DataFrame, label: str, note: str) -> None
                                       "days_held": "Days held"})
         view["R"] = pd.to_numeric(view["R"], errors="coerce").round(2)
         st.dataframe(view.sort_values("Idea date", ascending=False), hide_index=True, width="stretch")
+        csv_download(view.sort_values("Idea date", ascending=False), f"performance-{title.lower().replace(' ', '-')}",
+                     f"csv-perf-{title}", datetime.now(NY).strftime("%Y-%m-%d %H:%M"))
 
 
 def render_performance_tab() -> None:
@@ -2187,7 +2374,7 @@ def render_performance_tab() -> None:
     if not swing.empty and "verdict" in swing:
         st.markdown("#### By Claude verdict")
         if (swing["verdict"] == "unreviewed").all():
-            st.caption("No Claude reviews yet (added in a later phase). Every signal is shown as unreviewed.")
+            st.caption("No Claude verdicts recorded. The Swing and Covered calls tabs export a file you can upload to Claude yourself.")
         else:
             st.dataframe(summarize(swing, by="verdict"), hide_index=True, width="stretch")
     if not skipped.empty:
@@ -2245,9 +2432,15 @@ def main() -> None:
             st.info("A Schwab sign-in page is opening in your browser. Sign in once and approve; use a single tab.")
 
     holdings = load_holdings_safe()
-    tab_long, tab_swing, tab_calls, tab_puts, tab_whales, tab_cc, tab_levels, tab_portfolio, tab_perf, tab_jobs = st.tabs(
-        ["Long term", "Swing", "Calls", "Puts", "Whales", "Covered calls", "Levels", "Portfolio", "Performance", "Jobs"]
+    (tab_long, tab_swing, tab_calls, tab_puts, tab_options, tab_whales, tab_cc, tab_levels, tab_portfolio, tab_perf,
+     tab_export, tab_jobs) = st.tabs(
+        ["Long term", "Swing", "Calls", "Puts", "Options", "Whales", "Covered calls", "Levels", "Portfolio", "Performance",
+         "Export", "Jobs"]
     )
+    with tab_options:
+        render_options_hub()
+    with tab_export:
+        render_export()
 
     with tab_long:
         render_longterm()
@@ -2274,6 +2467,40 @@ def main() -> None:
         render_performance_tab()
     with tab_jobs:
         render_jobs()
+
+
+def render_export() -> None:
+    """Every current recommendation in one download, to review elsewhere (nothing is sent from the app)."""
+    from tool.export_all import collect, combined_csv, zip_of_csvs
+
+    st.subheader("Export all recommendations")
+    st.caption(
+        "The latest saved recommendations from every tab: Swing setups, Long term picks, every Calls and Puts section "
+        "(including Earnings) and Covered calls. Share counts, position values and contract sizes are left out. "
+        "Each row keeps its generated-at and data-as-of timestamps."
+    )
+    store = Store()
+    try:
+        sections = collect(store)
+    finally:
+        store.close()
+    if not sections:
+        st.info("Nothing saved yet. Run the jobs in the Jobs tab.")
+        return
+    st.dataframe(
+        pd.DataFrame({"Section": list(sections), "Rows": [len(df) for df in sections.values()]}),
+        hide_index=True, width="stretch",
+    )
+    today = datetime.now(NY).date().isoformat()
+    c1, c2 = st.columns(2)
+    c1.download_button(
+        "Download one CSV (all sections)", data=combined_csv(sections), file_name=f"sbtrade-all-{today}.csv",
+        mime="text/csv", key="export_all_csv",
+    )
+    c2.download_button(
+        "Download ZIP (one CSV per section)", data=zip_of_csvs(sections), file_name=f"sbtrade-all-{today}.zip",
+        mime="application/zip", key="export_all_zip",
+    )
 
 
 if __name__ == "__main__":

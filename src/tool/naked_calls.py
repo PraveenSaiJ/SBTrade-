@@ -208,7 +208,10 @@ def recommend_naked_calls(
     now = now or datetime.now(NY)
     out: list[NakedCallRec] = []
     for sym in symbols:
-        for expiry_type, expiry in expiry_candidates(sym, now, events):
+        candidates = expiry_candidates(sym, now, events)
+        if hasattr(source, "hint_chains"):  # one request for all of the symbol's expiries instead of one each
+            source.hint_chains(sym, "C", [d for _, d in candidates])
+        for expiry_type, expiry in candidates:
             out.append(recommend_one(sym, source, now, events, expiry_type, expiry, breakout_ready))
     return out
 

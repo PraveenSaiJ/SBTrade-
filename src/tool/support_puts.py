@@ -116,6 +116,8 @@ def recommend_support_puts(
             continue
         support, label = found
         rank, rank_source = rank_fn(symbol, bars["close"])
+        if hasattr(source, "hint_chains"):
+            source.hint_chains(symbol, "P", expiries)
         for expiry in expiries:
             out.append(_one(symbol, source, now, events, expiry, spot, support, label, rank, rank_source, cfg))
     return out

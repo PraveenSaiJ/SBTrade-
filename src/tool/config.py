@@ -154,6 +154,11 @@ class CallConfig:
     leaps_earnings_days: int = 14  # a LEAPS is only flagged for earnings this close (it spans several reports anyway)
     max_directional: int = 40  # candidates per run (best score first) to bound chain requests
     max_leaps: int = 60
+    earnings_days: int = 7  # names reporting within this many days get an earnings call idea
+    earnings_delta_low: float = 0.45
+    earnings_delta_high: float = 0.55
+    max_earnings: int = 40
+    earnings_max_ratio: float = 1.0  # the tab shows only calls whose break-even / expected move is at or under this
 
 
 @dataclass(frozen=True)
@@ -241,12 +246,19 @@ class AccountConfig:
 
 
 @dataclass(frozen=True)
+class JobsConfig:
+    history_days: int = 90  # job-run history older than this is pruned
+    notify: bool = True  # desktop notification on job failure or Schwab sign-in needed
+
+
+@dataclass(frozen=True)
 class DataConfig:
     rate_limit_per_min: int = 120  # Schwab market-data limit
     quote_batch: int = 100  # symbols per quotes request
     spot_cache_seconds: int = 15
     cache_dir: str = "data/cache"
     token_days: int = 7  # Schwab refresh-token lifetime
+    options_workers: int = 4  # option families built at the same time (the 120/min limiter is shared by all of them)
 
 
 @dataclass(frozen=True)
@@ -263,6 +275,7 @@ class Config:
     performance: PerformanceConfig = field(default_factory=PerformanceConfig)
     account: AccountConfig = field(default_factory=AccountConfig)
     data: DataConfig = field(default_factory=DataConfig)
+    jobs: JobsConfig = field(default_factory=JobsConfig)
 
 
 def _override(section: object, raw: dict | None) -> object:
@@ -291,7 +304,7 @@ def load_all(path: Path = SETTINGS_PATH) -> Config:
         cfg,
         screener=_override(cfg.screener, screener_raw),
         **{name: _override(getattr(cfg, name), raw.get(name)) for name in (
-            "options", "whales", "covered_calls", "puts", "calls", "levels", "freshness", "longterm", "performance", "account", "data")},
+            "options", "whales", "covered_calls", "puts", "calls", "levels", "freshness", "longterm", "performance", "account", "data", "jobs")},
     )
     if cfg.screener.trend_filter not in TREND_FILTERS:
         raise ValueError(f"trend_filter must be one of {TREND_FILTERS}, got {cfg.screener.trend_filter!r}")

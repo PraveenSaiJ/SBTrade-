@@ -152,3 +152,15 @@ def test_levels_tab_still_renders_and_the_zone_chart_builds_for_a_symbol():
     zones = compute_zones(bars, 100.0, datetime(2026, 10, 15, 17, 0, tzinfo=NY))
     frames = chart_data(bars, zones, now=datetime(2026, 10, 15, 17, 0, tzinfo=NY))
     assert set(frames) == {"candles", "averages", "zones"} and len(frames["candles"]) == 120
+
+
+def test_swing_and_covered_calls_offer_csv_downloads_and_no_claude_button(app):
+    assert [e.value for e in app.exception] == []
+    assert "Review with Claude" not in [b.label for b in app.button]
+
+
+def test_options_tab_gathers_weekly_lottos_and_0dte_and_the_old_tabs_stay(app):
+    assert [e.value for e in app.exception] == []
+    labels = [t.label for t in app.tabs]
+    assert "Options" in labels and "Calls" in labels and "Puts" in labels
+    assert {"Weekly calls and puts", "Lottos", "0DTE"} <= set(labels)

@@ -10,6 +10,7 @@ Directional plan (from the swing screener rules in CLAUDE.md):
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -107,9 +108,12 @@ def make_plan(symbol: str, bars: pd.DataFrame, spot: float, now: datetime) -> tu
     return None, setup.kind
 
 
-def daily_pivot_plan(levels) -> Plan:
-    """Same-day call plan from today's daily pivots: buy above P, stop halfway to S1, targets R1 and R2."""
+def daily_pivot_plan(levels, side: str = "call") -> Plan:
+    """Same-day plan from today's daily pivots. Call: buy above P, stop halfway to S1, targets R1 and R2.
+    Put: buy below P, stop halfway to R1, targets S1 and S2."""
     d = levels.daily.pivots
+    if side == "put":
+        return Plan("put", d.p, d.s1, (d.p + d.r1) / 2, d.s1, d.s2, "daily pivots")
     return Plan("call", d.p, d.r1, (d.p + d.s1) / 2, d.r1, d.r2, "daily pivots")
 
 
@@ -179,6 +183,11 @@ def _rules(symbol: str, plan: Plan, style: str, ask: float, multiple: float | No
             )
         else:
             entry = f"Buy calls only while {symbol} holds above ${plan.trigger:.2f} (support) and turns up"
+    elif plan.basis.endswith("pivots"):
+        entry = (
+            f"Buy puts only if {symbol} trades below ${plan.trigger:.2f} ({plan.basis[:-7]} pivot); "
+            f"do not chase below ${plan.chase_limit:.2f}"
+        )
     else:
         entry = (
             f"Buy puts only if {symbol} trades below ${plan.trigger:.2f} (weekly S1 breakdown); "
@@ -186,12 +195,13 @@ def _rules(symbol: str, plan: Plan, style: str, ask: float, multiple: float | No
         )
     way = "below" if call else "above"
     if style == "odte":
+        first, second = ("R1", "R2") if call else ("S1", "S2")
         stop = (
-            f"Exit if {symbol} trades below ${plan.stop:.2f}, or if the option loses 50% (${0.5 * ask:.2f}); "
+            f"Exit if {symbol} trades {way} ${plan.stop:.2f}, or if the option loses 50% (${0.5 * ask:.2f}); "
             "it expires today, so close it before the bell"
         )
         target = (
-            f"Sell half at ${plan.t1:.2f} (R1) and the rest at ${plan.t2:.2f} (R2), "
+            f"Sell half at ${plan.t1:.2f} ({first}) and the rest at ${plan.t2:.2f} ({second}), "
             f"or when the option doubles (${2 * ask:.2f})"
         )
     elif style == "lotto":
@@ -252,7 +262,7 @@ def _build(
 
 def _swing_and_lotto_ideas(
     symbol: str, plan: Plan, spot: float, source: DataSource, now: datetime, events: FinnhubEvents | None,
-    weekly_swing: bool = True,
+    weekly_swing: bool = True, include: tuple[str, ...] = ("weekly", "monthly"),
 ) -> list[BuyRec]:
     right = "C" if plan.side == "call" else "P"
     recs: list[BuyRec] = []
@@ -263,6 +273,8 @@ def _swing_and_lotto_ideas(
         ("swing", "monthly", monthly_expiry(now.date())),
     ):
         if style == "swing" and expiry_type == "weekly" and not weekly_swing:
+            continue
+        if expiry_type not in include:  # the weekly job and the monthly (buys) job each build their own expiry
             continue
         notes: list[str] = []
         hits, _ = earnings_guard(events, symbol, now.date(), expiry)
@@ -289,7 +301,8 @@ def _swing_and_lotto_ideas(
 
 
 def recommend_for_symbol(
-    symbol: str, source: DataSource, now: datetime, events: FinnhubEvents | None
+    symbol: str, source: DataSource, now: datetime, events: FinnhubEvents | None,
+    include: tuple[str, ...] = ("weekly", "monthly"),
 ) -> list[BuyRec]:
     try:
         bars = source.daily_bars(symbol, lookback_days=120)
@@ -299,23 +312,25 @@ def recommend_for_symbol(
         return [BuyRec(symbol, "?", "swing", "skip", f"data error: {exc}")]
     if plan is None:
         return [BuyRec(symbol, "?", "swing", "skip", f"setup is {kind} — no directional trade", spot=spot)]
-    return _swing_and_lotto_ideas(symbol, plan, spot, source, now, events)
+    return _swing_and_lotto_ideas(symbol, plan, spot, source, now, events, include=include)
 
 
-def recommend_odte(symbol: str, source: DataSource, now: datetime, events: FinnhubEvents | None) -> BuyRec:
-    """A call that expires today (0DTE), planned from today's daily pivots. Run it during market hours."""
+def recommend_odte(
+    symbol: str, source: DataSource, now: datetime, events: FinnhubEvents | None, side: str = "call"
+) -> BuyRec:
+    """A call or put that expires today (0DTE), planned from today's daily pivots. Run it during market hours."""
     try:
         bars = source.daily_bars(symbol, lookback_days=120)
         spot = source.spot(symbol)
         levels = compute_levels(bars, now=now, spot=spot, symbol=symbol)
-        plan = daily_pivot_plan(levels)
+        plan = daily_pivot_plan(levels, side)
     except Exception as exc:
-        return BuyRec(symbol, "call", "odte", "skip", f"data error: {exc}", "0DTE")
+        return BuyRec(symbol, side, "odte", "skip", f"data error: {exc}", "0DTE")
     today = now.date()
     try:
-        chain = source.option_chain(symbol, expiry=today, right="C")
+        chain = source.option_chain(symbol, expiry=today, right="C" if side == "call" else "P")
     except Exception as exc:
-        return BuyRec(symbol, "call", "odte", "skip", f"chain error: {exc}", "0DTE", today, spot=spot)
+        return BuyRec(symbol, side, "odte", "skip", f"chain error: {exc}", "0DTE", today, spot=spot)
     actual = chain["expiry"].iloc[0] if "expiry" in chain and len(chain) else today
     notes: list[str] = []
     if actual != today:
@@ -324,9 +339,10 @@ def recommend_odte(symbol: str, source: DataSource, now: datetime, events: Finnh
     if hits:
         notes.append(f"earnings {hits[0].date.isoformat()} before expiry — expect an IV crush and gap risk")
     expiry_type = "0DTE" if actual == today else "next expiry"
-    pick = pick_lotto(chain, "call", spot, plan.t1, delta_band=ODTE_DELTA, cap_pct=ODTE_PRICE_CAP_PCT)
+    pick = pick_lotto(chain, side, spot, plan.t1, delta_band=ODTE_DELTA, cap_pct=ODTE_PRICE_CAP_PCT)
     if pick is None:
-        return BuyRec(symbol, "call", "odte", "skip", "no call the first target (R1) can reach at a fair price",
+        target = "R1" if side == "call" else "S1"
+        return BuyRec(symbol, side, "odte", "skip", f"no {side} the first target ({target}) can reach at a fair price",
                       expiry_type, actual, spot=spot)
     return _build(symbol, plan, "odte", pick, spot, expiry_type, actual, notes)
 
@@ -344,13 +360,34 @@ def recommend_mag7_calls(symbol: str, source: DataSource, now: datetime, events:
     return _swing_and_lotto_ideas(symbol, plan, spot, source, now, events, weekly_swing=False)
 
 
-def recommend_special(
-    source: DataSource, now: datetime | None = None, events: FinnhubEvents | None = None
+def parallel_map(fn, items: list, workers: int = 1) -> list:
+    """`fn` over `items` in order, `workers` at a time (the data source is shared, so it must be thread-safe)."""
+    if workers <= 1 or len(items) <= 1:
+        return [fn(item) for item in items]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(fn, items))
+
+
+def recommend_odte_all(
+    source: DataSource, now: datetime | None = None, events: FinnhubEvents | None = None, workers: int = 1
 ) -> dict[str, list[BuyRec]]:
-    """The 0DTE and MAG7 call sections: families odte_call, mag7_lotto_call, mag7_swing_call."""
+    """0DTE calls and puts on the index ETFs and the MAG7: families odte_call and odte_put."""
+    now = now or datetime.now(NY)
+    jobs = [(symbol, side) for symbol in dict.fromkeys(INDEX_ETFS + MAG7) for side in ("call", "put")]
+    recs = parallel_map(lambda job: recommend_odte(job[0], source, now, events, job[1]), jobs, workers)
+    out: dict[str, list[BuyRec]] = {"odte_call": [], "odte_put": []}
+    for (_, side), rec in zip(jobs, recs):
+        out[f"odte_{side}"].append(rec)
+    return out
+
+
+def recommend_special(
+    source: DataSource, now: datetime | None = None, events: FinnhubEvents | None = None, odte: bool = True,
+) -> dict[str, list[BuyRec]]:
+    """MAG7 call sections plus (odte=True) the 0DTE calls: families odte_call, mag7_lotto_call, mag7_swing_call."""
     now = now or datetime.now(NY)
     out: dict[str, list[BuyRec]] = {"odte_call": [], "mag7_lotto_call": [], "mag7_swing_call": []}
-    for symbol in dict.fromkeys(INDEX_ETFS + MAG7):
+    for symbol in dict.fromkeys(INDEX_ETFS + MAG7) if odte else []:
         out["odte_call"].append(recommend_odte(symbol, source, now, events))
     for symbol in MAG7:
         for rec in recommend_mag7_calls(symbol, source, now, events):
@@ -373,15 +410,18 @@ def candidate_symbols(
 
 
 def recommend_buys(
-    symbols: list[str], source: DataSource, now: datetime | None = None, events: FinnhubEvents | None = None
+    symbols: list[str], source: DataSource, now: datetime | None = None, events: FinnhubEvents | None = None,
+    include: tuple[str, ...] = ("weekly", "monthly"), workers: int = 1,
 ) -> dict[str, list[BuyRec]]:
-    """Group results into the dashboard families: lotto, weekly, and long (monthly) for calls and puts."""
+    """Group results into the dashboard families: lotto, weekly, and long (monthly) for calls and puts.
+
+    `include` picks the expiries: the weekly job builds ("weekly",) (lottos and weekly swing), the buys job ("monthly",)."""
     now = now or datetime.now(NY)
     out: dict[str, list[BuyRec]] = {
         "lotto_call": [], "weekly_call": [], "long_call": [], "lotto_put": [], "weekly_put": [], "long_put": []
     }
-    for symbol in symbols:
-        for rec in recommend_for_symbol(symbol, source, now, events):
+    for found in parallel_map(lambda symbol: recommend_for_symbol(symbol, source, now, events, include), symbols, workers):
+        for rec in found:
             side = rec.side if rec.side in ("call", "put") else "call"
             if rec.style == "lotto":
                 kind = "lotto"

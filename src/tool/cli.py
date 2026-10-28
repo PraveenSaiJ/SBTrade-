@@ -9,22 +9,25 @@ import pandas as pd
 from pathlib import Path
 from datetime import date, datetime, timedelta
 
-from tool.buy_options import INDEX_ETFS, MAG7, candidate_symbols, recommend_buys, recommend_special
+from tool.buy_options import (
+    INDEX_ETFS, MAG7, candidate_symbols, recommend_buys, recommend_odte_all, recommend_special,
+)
 from tool.cc_monitor import monitor_covered_calls
 from tool.config import get_config, load_config
 from tool.directional_calls import recommend_directional, recommend_leaps
+from tool.earnings_calls import recommend_earnings_calls
 from tool.ivhistory import make_rank_fn
 from tool.support_puts import recommend_support_puts
 from tool.earnings_move import attach_expected_moves
 from tool.signals import signal_rows
 from tool.covered_calls import recommend_covered_calls
 from tool.income_calls import recommend_income_calls
-from tool.data.earnings import EventsUnavailable, FinnhubEvents, split_reports
+from tool.data.earnings import CalendarEvents, EventsUnavailable, FinnhubEvents, split_reports
 from tool.data.ibkr import IBKRDataSource
 from tool.data.memo import MemoSource
 from tool.data.schwab import REFRESH_TOKEN_DAYS, SchwabAuthRequired, SchwabDataSource, token_age_days
 from tool.jobs import JOB_SPECS, JobManager
-from tool.levels import NY, LevelsResult, compute_levels
+from tool.levels import MARKET_CLOSE, NY, LevelsResult, compute_levels
 from tool.longterm import MIN_BARS, LongTermRec, recommend_long_term
 from tool.naked_calls import default_symbols, recommend_naked_calls
 from tool.puts import csp_symbols, recommend_puts, wheel_symbols
@@ -286,19 +289,31 @@ def _summarize(family: str, recs: list[object]) -> None:
     recommended = [r for r in recs if r.status == "recommend"]
     print(f"{family}: {len(recommended)} recommended of {len(recs)} rows")
     for r in recommended:
-        print(f"  {r.symbol:6} {r.expiry_type:8} {r.expiry} strike {r.strike:.2f} bid {r.bid:.2f}")
+        # sell-side rows (puts, covered/naked calls) carry a bid; buy-side rows (directional, LEAPS) carry the ask to pay
+        price, label = (r.bid, "bid") if getattr(r, "bid", None) is not None else (getattr(r, "ask", None), "ask")
+        shown = "n/a" if price is None else f"{price:.2f}"
+        print(f"  {r.symbol:6} {r.expiry_type:8} {r.expiry} strike {r.strike:.2f} {label} {shown}")
+
+
+OPTION_PARTS = {
+    "calls": ("earnings_call", "directional_call", "leaps_call", "naked_call", "naked_call_breakout"),
+    "puts": ("csp_support", "csp", "naked_put", "wheel"),
+}
 
 
 def cmd_options(args: argparse.Namespace) -> int:
+    """Option families, built at the same time: `--part calls` or `--part puts` runs half of them, default is all."""
+    from concurrent.futures import ThreadPoolExecutor
+
     holdings = current_holdings()
-    source = SchwabDataSource()
+    source = MemoSource(SchwabDataSource())  # families ask for the same chains, bars and prices: fetch each once, in parallel safely
     store = Store()
     jobs = JobManager()
+    now = datetime.now(NY)
     try:
-        events = FinnhubEvents()
+        events = CalendarEvents(FinnhubEvents(), now.date())  # earnings asks answered from one cached calendar, not one request each
     except EventsUnavailable:
         events = None
-    now = datetime.now(NY)
 
     call_symbols = args.symbols or default_symbols(holdings)
     put_symbols = args.symbols or csp_symbols(holdings)
@@ -308,25 +323,61 @@ def cmd_options(args: argparse.Namespace) -> int:
         [s for syms in get_config().covered_calls.tiers.values() for s in syms] + list(holdings.watchlist_scan) + wheel
     ))
     source.prefetch_spots(list(dict.fromkeys(call_symbols + put_symbols + support_symbols)), ttl=600)
+    if events is not None:
+        try:
+            events.calendar()  # load (or fetch once) the earnings calendar before the families start asking
+        except Exception as exc:
+            print(f"Earnings calendar unavailable ({exc}); asking Finnhub per symbol", file=sys.stderr)
     latest = store.latest_setups()
+    longterm = store.latest_longterm()
     kinds = dict(zip(latest["symbol"], latest["kind"])) if not latest.empty else {}
-    families = [
-        ("csp_support", recommend_support_puts(
-            support_symbols, source, now=now, events=events, rank_fn=make_rank_fn(store), setup_kinds=kinds)),
-        ("directional_call", recommend_directional(
-            latest, source, now=now, events=events, rank_fn=make_rank_fn(store))),
-        ("leaps_call", recommend_leaps(
-            latest, store.latest_longterm(), source, now=now, events=events, rank_fn=make_rank_fn(store))),
-        ("naked_call", recommend_naked_calls(call_symbols, source, now=now, events=events)),
-        ("naked_call_breakout", recommend_naked_calls(call_symbols, source, now=now, events=events, breakout_ready=True)),
-        ("csp", recommend_puts(put_symbols, "csp", source, now=now, events=events)),
-        ("naked_put", recommend_puts(put_symbols, "naked_put", source, now=now, events=events)),
-        ("wheel", recommend_puts(wheel, "wheel", source, now=now, events=events) if wheel else []),
-    ]
+    rank_fn = make_rank_fn(store)
+
+    def earnings_calls() -> list:
+        if events is None:
+            return []
+        try:
+            calendar, _ = events.cached_calendar(now.date(), back=0, ahead=get_config().calls.earnings_days + 1)
+            pool = list(dict.fromkeys(
+                call_symbols + support_symbols + MAG7 + (list(latest["symbol"]) if not latest.empty else [])))
+            return recommend_earnings_calls(pool, calendar, source, now=now, rank_fn=rank_fn)
+        except Exception as exc:  # no calendar or a rate limit: the other families still run
+            print(f"Earnings calls skipped ({exc})", file=sys.stderr)
+            return []
+
+    builders = {
+        "earnings_call": earnings_calls,
+        "csp_support": lambda: recommend_support_puts(
+            support_symbols, source, now=now, events=events, rank_fn=rank_fn, setup_kinds=kinds),
+        "directional_call": lambda: recommend_directional(latest, source, now=now, events=events, rank_fn=rank_fn),
+        "leaps_call": lambda: recommend_leaps(latest, longterm, source, now=now, events=events, rank_fn=rank_fn),
+        "naked_call": lambda: recommend_naked_calls(call_symbols, source, now=now, events=events),
+        "naked_call_breakout": lambda: recommend_naked_calls(call_symbols, source, now=now, events=events, breakout_ready=True),
+        "csp": lambda: recommend_puts(put_symbols, "csp", source, now=now, events=events),
+        "naked_put": lambda: recommend_puts(put_symbols, "naked_put", source, now=now, events=events),
+        "wheel": lambda: recommend_puts(wheel, "wheel", source, now=now, events=events) if wheel else [],
+    }
+    wanted = [name for name in builders if args.part == "all" or name in OPTION_PARTS[args.part]]
+
+    def timed(name: str) -> tuple[str, list, float]:
+        started = time.monotonic()
+        return name, builders[name](), time.monotonic() - started
+
+    workers = max(1, get_config().data.options_workers)
+    print(f"Building {len(wanted)} option families ({args.part}) with {workers} at a time")
+    done: dict[str, list] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(timed, name) for name in wanted]
+        for future in futures:  # an auth error or crash in any family fails the job after the others finish
+            name, recs, seconds = future.result()
+            done[name] = recs
+            print(f"{name}: {len(recs)} rows in {seconds / 60:.1f} min")
+    families = [(name, done[name]) for name in wanted]  # canonical order, whatever finished first
     for family, recs in families:
         _summarize(family, recs)
     saved = store.save_option_recs(families)
     print(f"Saved {saved} option rows")
+    print(f"Schwab requests: {source.requests} (repeat asks served from memory)")
 
     if args.job:
         total = sum(len(recs) for _, recs in families)
@@ -353,15 +404,10 @@ def cmd_buys(args: argparse.Namespace) -> int:
         symbols = list(dict.fromkeys(calls + puts))
     source.prefetch_spots(list(symbols) + list(MAG7 + INDEX_ETFS), ttl=300)
     print(f"Buy ideas for {len(symbols)} symbols")
-    families = list(recommend_buys(symbols, source, events=events).items())
-    families += list(recommend_special(source, events=events).items())  # 0DTE and MAG7 sections
-    for family, recs in families:
-        good = [r for r in recs if r.status == "recommend"]
-        print(f"{family}: {len(good)} recommended of {len(recs)} rows")
-        for r in good:
-            print(f"  {r.symbol:6} {r.expiry_type:8} {r.expiry} strike {r.strike:.2f} ask {r.ask:.2f} {r.trigger}")
-    saved = store.save_option_recs(families)
-    print(f"Saved {saved} buy rows")
+    # weekly ideas and lottos are the weekly job, 0DTE is its own job: this one keeps the monthly swing ideas and MAG7
+    families = list(recommend_buys(symbols, source, events=events, include=("monthly",)).items())
+    families += list(recommend_special(source, events=events, odte=False).items())
+    _print_and_save(store, families, "buy")
     try:  # one ATM-IV reading per symbol per day (a no-op after the first buys run of the day)
         from tool.expiries import monthly_expiry
         from tool.ivhistory import record_atm_iv
@@ -382,6 +428,62 @@ def cmd_buys(args: argparse.Namespace) -> int:
 
     if args.job:
         total = sum(len(recs) for _, recs in families)
+        jobs.write_state(args.job, status="done", next_index=total, total=total, errors=0)
+    store.close()
+    return 0
+
+
+def _print_and_save(store: Store, families: list[tuple[str, list]], label: str) -> int:
+    families = [(name, recs) for name, recs in families if recs]
+    for family, recs in families:
+        good = [r for r in recs if r.status == "recommend"]
+        print(f"{family}: {len(good)} recommended of {len(recs)} rows")
+        for r in good:
+            print(f"  {r.symbol:6} {r.expiry_type:8} {r.expiry} strike {r.strike:.2f} ask {r.ask:.2f} {r.trigger}")
+    saved = store.save_option_recs(families)
+    print(f"Saved {saved} {label} rows")
+    return sum(len(recs) for _, recs in families)
+
+
+def cmd_weekly(args: argparse.Namespace) -> int:
+    """Weekly calls and puts to buy (weekly swing and lottos) on the bullish and bearish names from the swing scan."""
+    source = MemoSource(SchwabDataSource())
+    store = Store()
+    jobs = JobManager()
+    holdings = current_holdings(store)
+    try:
+        events = CalendarEvents(FinnhubEvents(), datetime.now(NY).date())
+    except EventsUnavailable:
+        events = None
+    if args.symbols:
+        symbols = args.symbols
+    else:
+        calls, puts = candidate_symbols(store.latest_setups(), holdings)
+        symbols = list(dict.fromkeys(calls + puts))
+    source.prefetch_spots(list(symbols), ttl=300)
+    print(f"Weekly ideas for {len(symbols)} symbols")
+    families = list(recommend_buys(
+        symbols, source, events=events, include=("weekly",), workers=get_config().data.options_workers).items())
+    total = _print_and_save(store, families, "weekly")
+    if args.job:
+        jobs.write_state(args.job, status="done", next_index=total, total=total, errors=0)
+    store.close()
+    return 0
+
+
+def cmd_odte(args: argparse.Namespace) -> int:
+    """0DTE calls and puts on the index ETFs and the MAG7 (run every 15 minutes during market hours)."""
+    source = MemoSource(SchwabDataSource())
+    store = Store()
+    jobs = JobManager()
+    try:
+        events = CalendarEvents(FinnhubEvents(), datetime.now(NY).date())
+    except EventsUnavailable:
+        events = None
+    source.prefetch_spots(list(dict.fromkeys(INDEX_ETFS + MAG7)), ttl=120)
+    families = list(recommend_odte_all(source, events=events, workers=get_config().data.options_workers).items())
+    total = _print_and_save(store, families, "0DTE")
+    if args.job:
         jobs.write_state(args.job, status="done", next_index=total, total=total, errors=0)
     store.close()
     return 0
@@ -540,18 +642,38 @@ def cmd_ccmonitor(args: argparse.Namespace) -> int:
 
 
 def cmd_run_job(args: argparse.Namespace) -> int:
-    """Start a dashboard job and wait for it to finish (used by Windows Task Scheduler)."""
+    """Start a dashboard job and wait for it to finish (used by Windows Task Scheduler).
+
+    Skips market holidays and weekends (--force overrides), records the run in the job history, and raises a desktop
+    notification when the Schwab sign-in is missing or about to expire, or when the job fails.
+    """
+    from tool.market_calendar import holiday_name, is_trading_day
+    from tool.notify import notified_today, notify
+
     jobs = JobManager()
+    jobs.prune_history()
+    today = datetime.now(NY).date()
+    if not args.force and not is_trading_day(today):
+        reason = holiday_name(today) or "weekend"
+        print(f"Market closed ({reason}); {args.name} skipped")
+        jobs.record_skipped(args.name, f"market closed: {reason}")
+        return 0
     age = token_age_days()
     if age is None or age >= REFRESH_TOKEN_DAYS:
         message = "Schwab login is missing or expired. Run: uv run tool schwab-login"
         print(message, file=sys.stderr)
         jobs.write_state(args.name, status="failed", error=message)
+        jobs.record_skipped(args.name, message, status="failed")
+        if not notified_today("login-expired", today.isoformat()):
+            notify("SBTrade: Schwab sign-in needed", "The Schwab login is missing or expired, so scheduled jobs cannot run. "
+                   "Open the Jobs tab or run: uv run tool schwab-login")
         return 2
     if age >= REFRESH_TOKEN_DAYS - 1:
         print(f"Warning: Schwab login is {age:.1f} days old and expires after {REFRESH_TOKEN_DAYS}. Run: uv run tool schwab-login")
+        if not notified_today("login-expiring", today.isoformat()):
+            notify("SBTrade: Schwab sign-in due", f"The Schwab login is {age:.1f} days old and expires after {REFRESH_TOKEN_DAYS}. Sign in soon.")
     try:
-        jobs.start(args.name)
+        jobs.start(args.name, trigger="scheduled")
     except RuntimeError as exc:
         print(exc)
         return 0
@@ -559,7 +681,47 @@ def cmd_run_job(args: argparse.Namespace) -> int:
         time.sleep(10)
     final = jobs.status(args.name)
     print(f"{args.name}: {final.get('status')} ({final.get('errors', 0)} errors)")
+    if final.get("status") != "done" and not notified_today(f"failed-{args.name}", today.isoformat()):
+        notify(f"SBTrade job {final.get('status')}: {args.name}", final.get("error") or f"See data/jobs/{args.name}.log")
     return 0 if final.get("status") == "done" else 1
+
+
+def cmd_outcomes(args: argparse.Namespace) -> int:
+    """After the close: refresh completed daily bars for every symbol with a recent signal or option idea, then score them."""
+    from tool.performance import DECIDED, score_all
+
+    source = SchwabDataSource()
+    store = Store()
+    jobs = JobManager()
+    since = (date.today() - timedelta(days=args.days)).isoformat()
+    conn = store._conn
+    symbols = sorted({r[0] for r in conn.execute("SELECT DISTINCT symbol FROM signals WHERE signal_date >= ?", (since,))}
+                     | {r[0] for r in conn.execute("SELECT DISTINCT symbol FROM option_recs WHERE substr(run_ts,1,10) >= ?", (since,))}
+                     | {r[0] for r in conn.execute("SELECT DISTINCT symbol FROM bought_options WHERE status = 'open'")})
+    errors = 0
+    print(f"Refreshing completed bars for {len(symbols)} symbols with ideas since {since}")
+    for index, symbol in enumerate(symbols):
+        try:
+            source.daily_bars(symbol, lookback_days=args.lookback_days)
+        except SchwabAuthRequired:
+            raise
+        except Exception as exc:
+            errors += 1
+            print(f"  {symbol}: {exc}", file=sys.stderr)
+        if args.job and index % 10 == 0:
+            jobs.write_state(args.job, next_index=index + 1, total=len(symbols), errors=errors)
+    now = datetime.now(NY)
+    scores = score_all(store, now.date() if now.time() >= MARKET_CLOSE else now.date() - timedelta(days=1))
+    for label, frame in scores.items():
+        if frame.empty:
+            print(f"{label}: nothing to score")
+            continue
+        counts = frame["result"].value_counts().to_dict()
+        print(f"{label}: {len(frame)} ideas, {int(frame['result'].isin(DECIDED).sum())} decided; {counts}")
+    if args.job:
+        jobs.write_state(args.job, status="done", next_index=len(symbols), total=len(symbols), errors=errors)
+    store.close()
+    return 0
 
 
 def cmd_portfolio(args: argparse.Namespace) -> int:
@@ -713,6 +875,15 @@ def main(argv: list[str] | None = None) -> int:
     buys_p.add_argument("--job", default=None, help="Job name for progress reporting (used by the dashboard)")
     buys_p.set_defaults(func=cmd_buys)
 
+    weekly_p = sub.add_parser("weekly", help="Weekly calls and puts to buy (weekly swing and lottos)")
+    weekly_p.add_argument("symbols", nargs="*", help="Optional symbols; default is bullish/bearish names from the swing scan")
+    weekly_p.add_argument("--job", default=None, help="Job name for progress reporting (used by the dashboard)")
+    weekly_p.set_defaults(func=cmd_weekly)
+
+    odte_p = sub.add_parser("odte", help="0DTE calls and puts on the index ETFs and the MAG7")
+    odte_p.add_argument("--job", default=None, help="Job name for progress reporting (used by the dashboard)")
+    odte_p.set_defaults(func=cmd_odte)
+
     whales_p = sub.add_parser("whales", help="Whale activity: large option premium and fresh volume")
     whales_p.add_argument("symbols", nargs="*", help="Optional symbols; default is indexes, MAG7, high-flow names, holdings")
     whales_p.add_argument("--job", default=None, help="Job name for progress reporting (used by the dashboard)")
@@ -720,7 +891,14 @@ def main(argv: list[str] | None = None) -> int:
 
     run_p = sub.add_parser("run-job", help="Run a dashboard job to completion (for scheduled tasks)")
     run_p.add_argument("name", choices=sorted(JOB_SPECS), help="Job name")
+    run_p.add_argument("--force", action="store_true", help="Run even when the market is closed")
     run_p.set_defaults(func=cmd_run_job)
+
+    out_p = sub.add_parser("outcomes", help="Refresh bars for open and pending ideas and score them (Performance tab)")
+    out_p.add_argument("--job", default=None, help="Job name for progress reporting (used by the dashboard)")
+    out_p.add_argument("--days", type=int, default=21, help="How far back to look for ideas (calendar days)")
+    out_p.add_argument("--lookback-days", type=int, default=90)
+    out_p.set_defaults(func=cmd_outcomes)
 
     recheck_p = sub.add_parser("recheck", help="Re-check saved swing setups against live prices")
     recheck_p.add_argument("--job", default=None, help="Job name for progress reporting (used by the dashboard)")
@@ -747,6 +925,7 @@ def main(argv: list[str] | None = None) -> int:
     options_p = sub.add_parser("options", help="Naked calls, cash-secured puts, naked puts, and wheel puts")
     options_p.add_argument("symbols", nargs="*", help="Optional symbols; default is the watchlist minus held names")
     options_p.add_argument("--job", default=None, help="Job name for progress reporting (used by the dashboard)")
+    options_p.add_argument("--part", choices=["all", "calls", "puts"], default="all", help="Build only the call or the put families")
     options_p.set_defaults(func=cmd_options)
 
     args = parser.parse_args(argv)

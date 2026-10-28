@@ -58,7 +58,9 @@ def test_run_job_refuses_when_schwab_login_is_expired(tmp_path, monkeypatch, cap
     jobs = JobManager(tmp_path)
     monkeypatch.setattr(cli, "JobManager", lambda: jobs)
     monkeypatch.setattr(cli, "token_age_days", lambda: 8.0)
-    assert cli.cmd_run_job(argparse.Namespace(name="scan")) == 2
+    monkeypatch.setattr("tool.notify.notify", lambda *a, **k: None)  # no balloon, no log entry from a test
+    monkeypatch.setattr("tool.notify.notified_today", lambda *a, **k: True)
+    assert cli.cmd_run_job(argparse.Namespace(name="scan", force=True)) == 2
     assert jobs.read_state("scan")["status"] == "failed"
     assert "schwab-login" in capsys.readouterr().err
 

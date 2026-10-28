@@ -71,6 +71,8 @@ def buy_why(row: object, setup: object | None, family: str) -> str:
     parts = []
     if family == "leaps_call":
         parts.append(f"Long-dated stock-replacement call ({_s(row, 'idea_source') or 'bullish setup'})")
+    elif family == "earnings_call":
+        parts.append(f"Event trade into earnings ({_s(row, 'idea_source') or 'reports soon'})")
     elif family == "directional_call":
         parts.append(f"Directional call, 14-60 days out ({_s(row, 'idea_source') or 'bullish setup'})")
     elif family == "odte_call":

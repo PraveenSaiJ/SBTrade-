@@ -223,7 +223,10 @@ def recommend_puts(
     now = now or datetime.now(NY)
     out: list[PutRec] = []
     for sym in symbols:
-        for expiry_type, expiry in expiry_candidates(sym, now, events):
+        candidates = expiry_candidates(sym, now, events)
+        if hasattr(source, "hint_chains"):  # one request for all of the symbol's expiries instead of one each
+            source.hint_chains(sym, "P", [d for _, d in candidates])
+        for expiry_type, expiry in candidates:
             out.append(recommend_one(sym, mode, source, now, events, expiry_type, expiry))
     return out
 

@@ -1,5 +1,5 @@
 # Registers the SBTrade scheduled tasks for the current user (no admin needed). Safe to re-run.
-# Times are local (this machine is on Eastern time). Tasks run only while you are logged in.
+# Times are local (this machine is on Eastern time). `tool run-job` skips market holidays and raises a desktop notification on failure. Tasks run only while you are logged in.
 # A task with Repeat set runs again every that many minutes for RepeatMinutes after its start time.
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -12,10 +12,19 @@ $tasks = @(
     @{ Name = "SBTrade-longterm";   Job = "longterm"; At = "09:25"; Note = "Long-term stock recommendations, after the scan refreshes price history" },
     @{ Name = "SBTrade-quick-refresh"; Job = "scan_light"; At = "09:35"; Note = "Holdings + watchlist swing refresh right after the open" },
     @{ Name = "SBTrade-cc-monitor"; Job = "ccmonitor"; At = "09:35"; Repeat = 15; RepeatMinutes = 380; Note = "Covered-call monitor every 15 minutes during market hours (snapshots kept 7 days)" },
-    @{ Name = "SBTrade-buys"; Job = "buys"; At = "09:40"; Repeat = 15; RepeatMinutes = 375; Note = "Buy ideas (lottos, swing calls/puts, MAG7, 0DTE) every 15 minutes during market hours" },
+    @{ Name = "SBTrade-buys"; Job = "buys"; At = "09:40"; Repeat = 15; RepeatMinutes = 375; Note = "Monthly swing calls/puts and MAG7 buy ideas every 15 minutes during market hours" },
+    @{ Name = "SBTrade-odte"; Job = "odte"; At = "09:35"; Repeat = 15; RepeatMinutes = 375; Note = "0DTE calls and puts (index ETFs, MAG7) every 15 minutes during market hours" },
+    @{ Name = "SBTrade-weekly"; Job = "weekly"; At = "09:45"; Repeat = 30; RepeatMinutes = 360; Note = "Weekly calls and puts (weekly swing and lottos) every 30 minutes during market hours" },
     @{ Name = "SBTrade-whales"; Job = "whales"; At = "09:32"; Repeat = 15; RepeatMinutes = 385; Note = "Whale activity (large option premium, fresh volume) every 15 minutes during market hours" },
-    @{ Name = "SBTrade-options";    Job = "options"; At = "10:00"; Note = "Naked calls, cash-secured puts, naked puts, wheel" }
+    @{ Name = "SBTrade-options-calls"; Job = "options_calls"; At = "10:00"; Note = "Earnings, directional, LEAPS and naked calls" },
+    @{ Name = "SBTrade-options-puts"; Job = "options_puts"; At = "10:10"; Note = "Cash-secured puts at support, cash-secured puts, naked puts, wheel" },
+    @{ Name = "SBTrade-recheck"; Job = "recheck"; At = "10:15"; Note = "Re-check swing setups against live prices (failed breakouts, overextension)" },
+    @{ Name = "SBTrade-cc-roll-check"; Job = "ccmonitor"; At = "15:45"; Note = "Final covered-call and roll check before the close" },
+    @{ Name = "SBTrade-outcomes"; Job = "outcomes"; At = "16:30"; Note = "Refresh bars after the close and score open ideas for the Performance tab" }
 )
+
+# The single options task was split in two; remove the old one if it is still registered.
+Unregister-ScheduledTask -TaskName "SBTrade-options" -Confirm:$false -ErrorAction SilentlyContinue
 
 foreach ($t in $tasks) {
     $action = New-ScheduledTaskAction -Execute $python -Argument "-m tool.cli run-job $($t.Job)" -WorkingDirectory $root

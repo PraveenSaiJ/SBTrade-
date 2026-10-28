@@ -628,6 +628,12 @@ class Store:
         )
         self._conn.commit()
 
+    def set_signal_verdict(self, signal_date: str, tab: str, symbol: str, verdict: str, reason: str) -> None:
+        """Record Claude's verdict beside the signal it reviewed (save_signals never overwrites it)."""
+        self._conn.execute("UPDATE signals SET verdict = ?, verdict_reason = ? WHERE signal_date = ? AND tab = ? AND symbol = ?",
+                           (verdict, reason, signal_date, tab, symbol))
+        self._conn.commit()
+
     def signals(self, tab: str | None = None, since: str | None = None) -> pd.DataFrame:
         sql, params = "SELECT * FROM signals WHERE 1 = 1", []
         if tab:
